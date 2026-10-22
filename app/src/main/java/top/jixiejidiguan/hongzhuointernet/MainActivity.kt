@@ -21,7 +21,7 @@ class MainActivity : ComponentActivity() {
             HongzhuointernetTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     Greeting(
-                        name = "Android",
+                        name = "鸿卓互联",
                         modifier = Modifier.padding(innerPadding)
                     )
                 }
