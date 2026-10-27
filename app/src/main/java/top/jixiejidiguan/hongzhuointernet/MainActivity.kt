@@ -2,6 +2,8 @@ package top.jixiejidiguan.hongzhuointernet
 
 import android.app.Notification
 import android.app.PendingIntent
+import android.bluetooth.BluetoothManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -41,6 +43,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -49,6 +52,7 @@ import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.Report
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -58,15 +62,17 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MediumTopAppBar
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -88,6 +94,8 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import top.jixiejidiguan.hongzhuointernet.ui.theme.HongzhuointernetTheme
+import java.text.DateFormat
+import java.util.Date
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -112,7 +120,9 @@ data class AppNotification(
     val time: Long,
     val isMedia: Boolean = false,
     val artwork: Bitmap? = null,
-    val actions: List<NotificationAction> = emptyList()
+    val actions: List<NotificationAction> = emptyList(),
+    val sourceDevice: String? = null,
+    val sourceAppName: String? = null
 )
 
 data class NotificationAction(
@@ -127,13 +137,29 @@ object NotificationStore {
     val notifications = mutableStateListOf<AppNotification>()
 
     fun addNotification(notification: AppNotification) {
-        // 避免重复或直接在头部插入最新通知
-        notifications.removeIf { it.id == notification.id }
-        notifications.add(0, notification)
+        upsertByTime(notification)
     }
 
     fun removeNotification(id: String) {
         notifications.removeIf { it.id == id }
+    }
+
+    fun addRemoteNotification(notification: AppNotification) {
+        upsertByTime(notification)
+    }
+
+    fun clearLocalNotifications() {
+        notifications.removeAll { it.sourceDevice == null }
+    }
+
+    private fun upsertByTime(notification: AppNotification) {
+        notifications.removeAll { it.id == notification.id }
+        val index = notifications.indexOfFirst { it.time <= notification.time }
+        if (index == -1) {
+            notifications.add(notification)
+        } else {
+            notifications.add(index, notification)
+        }
     }
 }
 
@@ -141,56 +167,150 @@ object NotificationStore {
  * 核心通知监听服务
  */
 class HongZhuoNotificationListener : android.service.notification.NotificationListenerService() {
+    override fun onListenerConnected() {
+        super.onListenerConnected()
+        listenerInstance = this
+        refreshActiveNotifications()
+    }
+
+    override fun onListenerDisconnected() {
+        if (listenerInstance === this) listenerInstance = null
+        super.onListenerDisconnected()
+        mainHandler.postDelayed({
+            if (isNotificationListenerEnabled(this)) {
+                requestRebind(ComponentName(this, HongZhuoNotificationListener::class.java))
+            }
+        }, REBIND_DELAY_MILLIS)
+    }
+
+    override fun onDestroy() {
+        if (listenerInstance === this) listenerInstance = null
+        super.onDestroy()
+    }
+
+    private fun refreshActiveNotifications() {
+        NotificationStore.clearLocalNotifications()
+        try {
+            activeNotifications
+                ?.sortedByDescending { it.postTime }
+                ?.forEach { processNotification(it, sync = false) }
+        } catch (e: SecurityException) {
+            android.util.Log.e("NotificationListener", "Unable to load active notifications", e)
+        }
+    }
+
     override fun onNotificationPosted(sbn: android.service.notification.StatusBarNotification?) {
         super.onNotificationPosted(sbn)
-        sbn?.let {
-            val pkg = it.packageName
-            val postedNotification = it.notification
-            val extras = postedNotification.extras
-            val isMedia = postedNotification.category == Notification.CATEGORY_TRANSPORT ||
-                    extras.containsKey(Notification.EXTRA_MEDIA_SESSION)
-            val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: "新通知"
-            val text = if (isMedia) {
-                extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()
-                    ?: extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString().orEmpty()
-            } else {
-                extras.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
-            }
-
-            val notification = AppNotification(
-                id = it.key,
-                packageName = pkg,
-                title = title,
-                text = text,
-                time = it.postTime,
-                isMedia = isMedia,
-                artwork = if (isMedia) {
-                   extras.getParcelable(Notification.EXTRA_PICTURE, Bitmap::class.java)
-                } else {
-                    null
-                },
-                actions = if (isMedia) {
-                    postedNotification.actions
-                        ?.take(3)
-                        ?.map { action ->
-                            NotificationAction(
-                                title = action.title?.toString().orEmpty(),
-                                pendingIntent = action.actionIntent
-                            )
-                        }
-                        .orEmpty()
-                } else {
-                    emptyList()
-                }
-            )
-            NotificationStore.addNotification(notification)
-        }
+        sbn?.let { processNotification(it, sync = true) }
     }
 
     override fun onNotificationRemoved(sbn: android.service.notification.StatusBarNotification?) {
         super.onNotificationRemoved(sbn)
         sbn?.let {
             NotificationStore.removeNotification(it.key)
+            if (it.packageName != packageName) {
+                BluetoothSyncService.sendRemoval(this, it.key)
+            }
+        }
+    }
+
+    private fun processNotification(
+        statusBarNotification: android.service.notification.StatusBarNotification,
+        sync: Boolean
+    ) {
+        if (statusBarNotification.packageName == packageName) return
+        val postedNotification = statusBarNotification.notification
+        val extras = postedNotification.extras
+        val isMedia = postedNotification.category == Notification.CATEGORY_TRANSPORT ||
+                extras.containsKey(Notification.EXTRA_MEDIA_SESSION)
+        val title = extras.getCharSequence(Notification.EXTRA_TITLE)
+            ?: extras.getCharSequence(Notification.EXTRA_TITLE_BIG)
+            ?: postedNotification.tickerText
+        val text = listOf(
+            extras.getCharSequence(Notification.EXTRA_BIG_TEXT),
+            extras.getCharSequence(Notification.EXTRA_TEXT),
+            extras.getCharSequence(Notification.EXTRA_SUB_TEXT)
+        ).firstOrNull { !it.isNullOrBlank() }
+        val textLines = extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)
+            ?.joinToString(separator = "\n") { it.toString() }
+        val appName = try {
+            packageManager.getApplicationLabel(
+                packageManager.getApplicationInfo(statusBarNotification.packageName, 0)
+            ).toString()
+        } catch (e: PackageManager.NameNotFoundException) {
+            android.util.Log.w(
+                "NotificationListener",
+                "Could not resolve notification source app ${statusBarNotification.packageName}",
+                e
+            )
+            statusBarNotification.packageName
+        } catch (e: SecurityException) {
+            android.util.Log.w(
+                "NotificationListener",
+                "Permission denied while resolving notification source app ${statusBarNotification.packageName}",
+                e
+            )
+            statusBarNotification.packageName
+        }
+        val notification = AppNotification(
+            id = statusBarNotification.key,
+            packageName = statusBarNotification.packageName,
+            title = title?.toString()?.takeIf { it.isNotBlank() } ?: appName,
+            text = text?.toString()?.takeIf { it.isNotBlank() }
+                ?: textLines.orEmpty(),
+            time = statusBarNotification.postTime,
+            isMedia = isMedia,
+            artwork = if (isMedia) {
+                extras.getParcelable(Notification.EXTRA_PICTURE, Bitmap::class.java)
+            } else {
+                null
+            },
+            actions = if (isMedia) {
+                postedNotification.actions
+                    ?.take(3)
+                    ?.mapNotNull { action ->
+                        action.actionIntent?.let { pendingIntent ->
+                            NotificationAction(
+                                title = action.title?.toString().orEmpty(),
+                                pendingIntent = pendingIntent
+                            )
+                        }
+                    }
+                    .orEmpty()
+            } else {
+                emptyList()
+            },
+            sourceAppName = appName
+        )
+        NotificationStore.addNotification(notification)
+        if (sync && statusBarNotification.packageName != packageName) {
+            BluetoothSyncService.sendNotification(this, notification)
+        }
+    }
+
+    companion object {
+        private const val REBIND_DELAY_MILLIS = 1000L
+        private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+        @Volatile
+        private var listenerInstance: HongZhuoNotificationListener? = null
+
+        fun refresh(context: Context) {
+            if (!isNotificationListenerEnabled(context)) return
+            val listener = listenerInstance
+            if (listener != null) {
+                listener.refreshActiveNotifications()
+                return
+            }
+            try {
+                requestRebind(ComponentName(context, HongZhuoNotificationListener::class.java))
+            } catch (e: SecurityException) {
+                android.util.Log.e(
+                    "NotificationListener",
+                    "Unable to rebind notification listener",
+                    e
+                )
+            }
         }
     }
 }
@@ -202,9 +322,10 @@ private enum class Destination(val title: String) {
 }
 
 private val bluetoothPermissions = arrayOf(
-    android.Manifest.permission.BLUETOOTH_SCAN,
-    android.Manifest.permission.BLUETOOTH_CONNECT,
-    android.Manifest.permission.BLUETOOTH_ADVERTISE
+    android.Manifest.permission.BLUETOOTH_CONNECT
+)
+private val notificationPermissions = arrayOf(
+    android.Manifest.permission.POST_NOTIFICATIONS
 )
 
 @Preview
@@ -220,23 +341,61 @@ private fun NotificationHome() {
     var isBluetoothPermissionGranted by remember {
         mutableStateOf(hasBluetoothPermissions(context))
     }
+    var isPostNotificationPermissionGranted by remember {
+        mutableStateOf(hasPostNotificationPermission(context))
+    }
+    var pairedBluetoothDevices by remember {
+        mutableStateOf(getPairedBluetoothDevices(context))
+    }
+    var boundBluetoothDeviceAddresses by remember {
+        mutableStateOf(BluetoothSyncPrefs.boundAddresses(context))
+    }
     val bluetoothPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         isBluetoothPermissionGranted = hasBluetoothPermissions(context)
+        pairedBluetoothDevices = getPairedBluetoothDevices(context)
+        if (!isBluetoothPermissionGranted) {
+            BluetoothSyncService.stop(context)
+        }
+    }
+    val postNotificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        isPostNotificationPermissionGranted = hasPostNotificationPermission(context)
     }
 
     val snackbarHostState = remember { SnackbarHostState() }
 
     // 监听生命周期，当用户从系统设置返回时自动更新通知监听权限状态
-    LaunchedEffect(lifecycleOwner) {
+    DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 isPermissionGranted = isNotificationListenerEnabled(context)
+                if (isPermissionGranted) {
+                    HongZhuoNotificationListener.refresh(context)
+                }
                 isBluetoothPermissionGranted = hasBluetoothPermissions(context)
+                isPostNotificationPermissionGranted = hasPostNotificationPermission(context)
+                pairedBluetoothDevices = getPairedBluetoothDevices(context)
+                val bluetoothEnabled = isBluetoothEnabled(context)
+                val boundAddresses = BluetoothSyncPrefs.boundAddresses(context)
+                boundBluetoothDeviceAddresses =
+                    if (!bluetoothEnabled) boundAddresses else boundAddresses.intersect(
+                        pairedBluetoothDevices.mapTo(mutableSetOf()) { it.address }
+                    )
+                (boundAddresses - boundBluetoothDeviceAddresses).forEach { address ->
+                    BluetoothSyncPrefs.setBound(context, address, false)
+                }
+                if (isBluetoothPermissionGranted && boundBluetoothDeviceAddresses.isNotEmpty()) {
+                    BluetoothSyncService.start(context)
+                } else {
+                    BluetoothSyncService.stop(context)
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     BackHandler(enabled = currentPage != Destination.Home) {
@@ -314,6 +473,26 @@ private fun NotificationHome() {
                         } else {
                             openAppPermissionSettings(context)
                         }
+                    },
+                    pairedBluetoothDevices = pairedBluetoothDevices,
+                    boundBluetoothDeviceAddresses = boundBluetoothDeviceAddresses,
+                    onToggleBluetoothDevice = { address ->
+                        val shouldBind = address !in boundBluetoothDeviceAddresses
+                        BluetoothSyncPrefs.setBound(context, address, shouldBind)
+                        boundBluetoothDeviceAddresses = BluetoothSyncPrefs.boundAddresses(context)
+                        if (boundBluetoothDeviceAddresses.isEmpty()) {
+                            BluetoothSyncService.stop(context)
+                        } else if (isBluetoothPermissionGranted) {
+                            BluetoothSyncService.start(context)
+                        }
+                    },
+                    onOpenBluetoothSettings = { openBluetoothSettings(context) },
+                    isPostNotificationPermissionGranted = isPostNotificationPermissionGranted,
+                    onRequestPostNotificationPermission = {
+                        postNotificationPermissionLauncher.launch(notificationPermissions)
+                    },
+                    onSendCustomMessage = { title, text ->
+                        BluetoothSyncService.sendCustomMessage(context, title, text)
                     }
                 )
 
@@ -345,6 +524,46 @@ private fun hasBluetoothPermissions(context: Context): Boolean =
     bluetoothPermissions.all { permission ->
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
     }
+
+private fun hasPostNotificationPermission(context: Context): Boolean =
+    ContextCompat.checkSelfPermission(
+        context,
+        android.Manifest.permission.POST_NOTIFICATIONS
+    ) == PackageManager.PERMISSION_GRANTED
+
+private fun getPairedBluetoothDevices(context: Context): List<BluetoothPeer> {
+    if (!hasBluetoothPermissions(context)) return emptyList()
+    return try {
+        val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+        if (adapter == null) {
+            emptyList()
+        } else {
+            adapter.bondedDevices
+                .map { device -> BluetoothPeer(device.address, device.name ?: device.address) }
+                .sortedBy { it.name.lowercase() }
+        }
+    } catch (e: SecurityException) {
+        android.util.Log.w("BluetoothSync", "Unable to read paired Bluetooth devices", e)
+        emptyList()
+    }
+}
+
+private fun isBluetoothEnabled(context: Context): Boolean {
+    if (!hasBluetoothPermissions(context)) return false
+    return try {
+        (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager)
+            .adapter?.isEnabled == true
+    } catch (e: SecurityException) {
+        android.util.Log.w("BluetoothSync", "Unable to read Bluetooth adapter state", e)
+        false
+    }
+}
+
+private fun openBluetoothSettings(context: Context) {
+    context.startActivity(
+        Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    )
+}
 
 private fun openAppPermissionSettings(context: Context) {
     val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
@@ -400,7 +619,13 @@ private fun PermissionRequiredScreen(onRequestPermission: () -> Unit) {
 
 @Composable
 private fun HomePage(notifications: List<AppNotification>) {
-    val orderedNotifications = notifications.sortedByDescending { it.isMedia }
+    val localNotifications = notifications
+        .filter { it.sourceDevice == null }
+        .sortedByDescending { it.isMedia }
+    val syncedNotifications = notifications
+        .filter { it.sourceDevice != null }
+        .groupBy { it.sourceDevice.orEmpty() }
+        .toSortedMap()
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(
@@ -411,19 +636,61 @@ private fun HomePage(notifications: List<AppNotification>) {
         ),
         verticalArrangement = Arrangement.spacedBy(3.dp)
     ) {
-        if (orderedNotifications.isEmpty()) {
+        if (notifications.isEmpty()) {
             item(key = "empty") {
                 EmptyNotificationState()
             }
         } else {
-            itemsIndexed(orderedNotifications, key = { _, item -> item.id }) { index, item ->
-                NotificationListItem(
-                    notification = item,
-                    index = index,
-                    itemCount = orderedNotifications.size
-                )
+            if (localNotifications.isNotEmpty()) {
+                item(key = "local-header") {
+                    NotificationSectionHeader(
+                        title = "本机通知",
+                        count = localNotifications.size
+                    )
+                }
+                itemsIndexed(localNotifications, key = { _, item -> item.id }) { index, item ->
+                    NotificationListItem(item, index, localNotifications.size)
+                }
+            }
+            syncedNotifications.forEach { (deviceName, deviceNotifications) ->
+                val orderedDeviceNotifications =
+                    deviceNotifications.sortedByDescending { it.isMedia }
+                item(key = "synced-header-$deviceName") {
+                    NotificationSectionHeader(
+                        title = "同步设备 · $deviceName",
+                        count = orderedDeviceNotifications.size
+                    )
+                }
+                itemsIndexed(
+                    orderedDeviceNotifications,
+                    key = { _, item -> item.id }
+                ) { index, item ->
+                    NotificationListItem(item, index, orderedDeviceNotifications.size)
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun NotificationSectionHeader(title: String, count: Int) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 12.dp, top = 16.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary
+        )
+        Text(
+            text = "$count 条",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 
@@ -570,7 +837,14 @@ private fun NotificationListItem(
                             maxLines = 1
                         )
                         Text(
-                            text = "媒体播放器",
+                            text = notification.sourceDevice?.let { "来自 $it · 蓝牙同步" }
+                                ?: "媒体播放器",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                        Text(
+                            text = DateFormat.getTimeInstance(DateFormat.SHORT)
+                                .format(Date(notification.time)),
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
@@ -627,10 +901,18 @@ private fun NotificationListItem(
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        text = "来源: ${notification.packageName}",
+                        text = notification.sourceDevice?.let {
+                            "来自 $it · ${notification.sourceAppName ?: notification.packageName}"
+                        } ?: "来源: ${notification.sourceAppName ?: notification.packageName}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.outline,
                         maxLines = 1
+                    )
+                    Text(
+                        text = DateFormat.getTimeInstance(DateFormat.SHORT)
+                            .format(Date(notification.time)),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline
                     )
                 }
             }
@@ -643,72 +925,216 @@ private fun SettingsPage(
     isPermissionGranted: Boolean,
     onTogglePermission: () -> Unit,
     isBluetoothPermissionGranted: Boolean,
-    onBluetoothPermissionChange: (Boolean) -> Unit
+    onBluetoothPermissionChange: (Boolean) -> Unit,
+    pairedBluetoothDevices: List<BluetoothPeer>,
+    boundBluetoothDeviceAddresses: Set<String>,
+    onToggleBluetoothDevice: (String) -> Unit,
+    onOpenBluetoothSettings: () -> Unit,
+    isPostNotificationPermissionGranted: Boolean,
+    onRequestPostNotificationPermission: () -> Unit,
+    onSendCustomMessage: (String, String) -> Unit
 ) {
-    Column(
+    var isSendDialogOpen by remember { mutableStateOf(false) }
+    var messageTitle by remember { mutableStateOf("") }
+    var messageText by remember { mutableStateOf("") }
+
+    LazyColumn(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 16.dp, vertical = 12.dp)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(bottom = 16.dp)
     ) {
-        Text(
-            text = "权限",
-            style = MaterialTheme.typography.labelLarge,
-            color = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.padding(start = 16.dp, bottom = 8.dp)
-        )
-        ListItem(
-            supportingContent = {
-                Text(
-                    if (isPermissionGranted) "已授权，可实时捕获通知"
-                    else "未授权，无法捕获通知"
-                )
-            },
-            trailingContent = {
-                Switch(
-                    checked = isPermissionGranted,
-                    onCheckedChange = { onTogglePermission() }
-                )
-            },
-            colors = ListItemDefaults.colors(
-                containerColor = MaterialTheme.colorScheme.surfaceContainerLow
-            ),
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(88.dp)
-        ) {
-            Text("通知访问权限")
+        item {
+            Text(
+                text = "权限",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(start = 16.dp, bottom = 4.dp)
+            )
         }
-        ListItem(
-            supportingContent = {
-                Text(
-                    if (isBluetoothPermissionGranted) "已授权，可使用蓝牙进行设备通信"
-                    else "未授权，点击开关申请蓝牙权限"
+        item {
+            ListItem(
+                supportingContent = {
+                    Text(
+                        if (isPermissionGranted) "已授权，可实时捕获通知"
+                        else "未授权，无法捕获通知"
+                    )
+                },
+                trailingContent = {
+                    Switch(
+                        checked = isPermissionGranted,
+                        onCheckedChange = { onTogglePermission() }
+                    )
+                },
+                colors = ListItemDefaults.colors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerLow
                 )
-            },
-            trailingContent = {
-                Switch(
-                    checked = isBluetoothPermissionGranted,
-                    onCheckedChange = onBluetoothPermissionChange
-                )
-            },
-            colors = ListItemDefaults.colors(
-                containerColor = MaterialTheme.colorScheme.surfaceContainerLow
-            ),
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(88.dp)
-        ) {
-            Text("蓝牙权限")
+            ) {
+                Text("通知访问权限")
+            }
         }
-        HorizontalDivider(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-            color = MaterialTheme.colorScheme.outlineVariant
-        )
-        Text(
-            text = "通知数据仅在应用运行时实时捕获并保存在内存中。",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 16.dp)
+        item {
+            ListItem(
+                supportingContent = {
+                    Text(
+                        if (isBluetoothPermissionGranted) "已授权，可连接已配对的设备"
+                        else "未授权，点击开关申请蓝牙连接权限"
+                    )
+                },
+                trailingContent = {
+                    Switch(
+                        checked = isBluetoothPermissionGranted,
+                        onCheckedChange = onBluetoothPermissionChange
+                    )
+                },
+                colors = ListItemDefaults.colors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+                )
+            ) {
+                Text("蓝牙权限")
+            }
+        }
+        item {
+            HorizontalDivider(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                color = MaterialTheme.colorScheme.outlineVariant
+            )
+            Text(
+                text = "设备绑定",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(start = 16.dp, bottom = 4.dp)
+            )
+        }
+        item {
+            Button(
+                onClick = onOpenBluetoothSettings,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = isBluetoothPermissionGranted
+            ) {
+                Text("前往系统蓝牙配对设备")
+            }
+        }
+        if (pairedBluetoothDevices.isEmpty()) {
+            item {
+                Text(
+                    text = "没有可用的已配对设备。请先在系统蓝牙设置中完成配对。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp)
+                )
+            }
+        } else {
+            items(pairedBluetoothDevices, key = { it.address }) { device ->
+                val isBound = device.address in boundBluetoothDeviceAddresses
+                ListItem(
+                    supportingContent = {
+                        Text(if (isBound) "已绑定，通知将与此设备双向同步" else "点击绑定此设备")
+                    },
+                    trailingContent = {
+                        if (isBound) Text("已绑定", color = MaterialTheme.colorScheme.primary)
+                    },
+                    colors = ListItemDefaults.colors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(enabled = isBluetoothPermissionGranted) {
+                            onToggleBluetoothDevice(device.address)
+                        }
+                ) {
+                    Text(device.name)
+                }
+            }
+        }
+        if (boundBluetoothDeviceAddresses.isNotEmpty()) {
+            item {
+                Button(
+                    onClick = { isSendDialogOpen = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = isBluetoothPermissionGranted
+                ) {
+                    Text("发送通知栏消息")
+                }
+            }
+            item {
+                Text(
+                    text = "已绑定 ${boundBluetoothDeviceAddresses.size} 台设备；发送的消息会广播给全部绑定设备。对端需允许发布通知，才能在其通知栏看到消息。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp)
+                )
+            }
+        }
+        item {
+            HorizontalDivider(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                color = MaterialTheme.colorScheme.outlineVariant
+            )
+            Text(
+                text = "双方需安装应用、完成系统蓝牙配对，并在此互相绑定。通知数据仅在应用运行时捕获并保存在内存中；同步内容包含通知文字和应用标识，不包含媒体封面或播放控制。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp)
+            )
+        }
+    }
+
+    if (isSendDialogOpen) {
+        AlertDialog(
+            onDismissRequest = { isSendDialogOpen = false },
+            title = { Text("发送通知栏消息") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(
+                        value = messageTitle,
+                        onValueChange = { messageTitle = it },
+                        label = { Text("标题") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = messageText,
+                        onValueChange = { messageText = it },
+                        label = { Text("消息内容") },
+                        minLines = 2,
+                        maxLines = 4,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    if (!isPostNotificationPermissionGranted) {
+                        TextButton(onClick = onRequestPostNotificationPermission) {
+                            Text("授予本机接收通知权限")
+                        }
+                        Text(
+                            text = "消息会发送到已绑定设备。接收设备需授予通知权限，才能在其通知栏显示。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = messageText.isNotBlank(),
+                    onClick = {
+                        onSendCustomMessage(
+                            messageTitle.ifBlank { "来自同步设备的消息" },
+                            messageText.trim()
+                        )
+                        messageTitle = ""
+                        messageText = ""
+                        isSendDialogOpen = false
+                    }
+                ) {
+                    Text("发送")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { isSendDialogOpen = false }) {
+                    Text("取消")
+                }
+            }
         )
     }
 }
